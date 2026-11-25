@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import base64
 import shutil
 import tempfile
@@ -103,19 +104,26 @@ Devuelve SOLO JSON:
 
         for model_name in ["gemini-3.0-flash", "gemini-3.8-flash"]:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-            res = requests.post(url, json=payload, timeout=30)
-            if res.ok:
-                raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
-                if parsed.get("title"):
-                    return {
-                        "recognized": True,
-                        "title": parsed.get("title", "").strip(),
-                        "artist": parsed.get("artist", "Artista Detectado").strip(),
-                        "album": parsed.get("genre", "IA Acústica"),
-                        "lyricsSnippet": parsed.get("lyricsHeard", ""),
-                        "source": "Gemini Audio"
-                    }
+            for attempt in range(3):
+                res = requests.post(url, json=payload, timeout=35)
+                if res.ok:
+                    raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
+                    if parsed.get("title"):
+                        return {
+                            "recognized": True,
+                            "title": parsed.get("title", "").strip(),
+                            "artist": parsed.get("artist", "Artista Detectado").strip(),
+                            "album": parsed.get("genre", "IA Acústica"),
+                            "lyricsSnippet": parsed.get("lyricsHeard", ""),
+                            "source": "Gemini Audio"
+                        }
+                    return None
+                err_txt = res.json().get("error", {}).get("message", res.text) if res.content else res.text
+                if "high demand" in err_txt.lower() or res.status_code in (429, 503):
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                break
     except Exception as e:
         print("Gemini error:", e)
     return None
@@ -161,10 +169,18 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
     last_err = ""
     for model_name in ["gemini-3.0-flash", "gemini-3.8-flash"]:
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-        res = requests.post(endpoint, json=payload, timeout=120)
-        if res.ok:
+        for attempt in range(3):
+            res = requests.post(endpoint, json=payload, timeout=120)
+            if res.ok:
+                break
+            err_json = res.json() if res.content else {}
+            last_err = err_json.get("error", {}).get("message", res.text)
+            if "high demand" in last_err.lower() or res.status_code in (429, 503):
+                time.sleep(3 * (attempt + 1))
+                continue
             break
-        last_err = res.json().get("error", {}).get("message", res.text)
+        if res and res.ok:
+            break
 
     if not res or not res.ok:
         raise RuntimeError(f"Gemini Directo falló: {last_err}")
@@ -192,7 +208,7 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v3"})
+    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v4"})
 
 
 @app.route("/api/scan-youtube", methods=["POST"])
