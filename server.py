@@ -13,6 +13,8 @@ import yt_dlp
 app = Flask(__name__)
 CORS(app)
 
+GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-2.0-flash"]
+
 
 def get_audio_duration(filepath):
     cmd = [
@@ -43,6 +45,56 @@ def extract_wav_clip(input_path, start_sec, duration_sec, out_wav):
     return os.path.exists(out_wav) and os.path.getsize(out_wav) > 1000
 
 
+def parse_json_safely(raw_text):
+    if not raw_text:
+        return {}
+    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(cleaned[start:end + 1])
+            except Exception:
+                pass
+    return {}
+
+
+def post_gemini_with_fallback(gemini_key, payload, timeout_sec=60):
+    last_err = "Sin respuesta de Gemini"
+    for model_name in GEMINI_MODELS:
+        endpoint = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_name}:generateContent?key={gemini_key}"
+        )
+        for attempt in range(2):
+            try:
+                res = requests.post(endpoint, json=payload, timeout=timeout_sec)
+            except requests.Timeout:
+                last_err = f"Tiempo de espera agotado en {model_name}"
+                time.sleep(1.5)
+                continue
+            except Exception as req_err:
+                last_err = str(req_err)
+                break
+
+            if res.ok:
+                return res.json()
+
+            err_json = res.json() if res.content else {}
+            last_err = err_json.get("error", {}).get("message", res.text or f"HTTP {res.status_code}")
+            lower_err = last_err.lower()
+
+            if res.status_code in (429, 503) or "high demand" in lower_err or "overloaded" in lower_err:
+                time.sleep(2 * (attempt + 1))
+                continue
+            break
+
+    raise RuntimeError(last_err)
+
+
 def recognize_audd(wav_path, audd_key):
     if not audd_key:
         return None
@@ -64,8 +116,10 @@ def recognize_audd(wav_path, audd_key):
                 "title": r.get("title", ""),
                 "artist": r.get("artist", ""),
                 "album": r.get("album", "AudD Shazam"),
-                "coverUrl": (sp.get("album", {}).get("images", [{}])[0].get("url")
-                             or dz.get("album", {}).get("cover_medium", "")),
+                "coverUrl": (
+                    sp.get("album", {}).get("images", [{}])[0].get("url")
+                    or dz.get("album", {}).get("cover_medium", "")
+                ),
                 "previewUrl": sp.get("preview_url") or dz.get("preview", ""),
                 "spotifyUrl": sp.get("external_urls", {}).get("spotify", ""),
                 "source": "Shazam / AudD"
@@ -102,43 +156,37 @@ Devuelve SOLO JSON:
             }
         }
 
-        for model_name in ["gemini-3.0-flash", "gemini-3.8-flash"]:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-            for attempt in range(3):
-                res = requests.post(url, json=payload, timeout=35)
-                if res.ok:
-                    raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
-                    if parsed.get("title"):
-                        return {
-                            "recognized": True,
-                            "title": parsed.get("title", "").strip(),
-                            "artist": parsed.get("artist", "Artista Detectado").strip(),
-                            "album": parsed.get("genre", "IA Acústica"),
-                            "lyricsSnippet": parsed.get("lyricsHeard", ""),
-                            "source": "Gemini Audio"
-                        }
-                    return None
-                err_txt = res.json().get("error", {}).get("message", res.text) if res.content else res.text
-                if "high demand" in err_txt.lower() or res.status_code in (429, 503):
-                    time.sleep(3 * (attempt + 1))
-                    continue
-                break
+        data = post_gemini_with_fallback(gemini_key, payload, timeout_sec=35)
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        raw = "\n".join(p.get("text", "") for p in parts)
+        parsed = parse_json_safely(raw)
+
+        title = str(parsed.get("title", "")).strip()
+        if title:
+            return {
+                "recognized": True,
+                "title": title,
+                "artist": str(parsed.get("artist", "Artista Detectado")).strip() or "Artista Detectado",
+                "album": str(parsed.get("genre", "IA Acústica")).strip() or "IA Acústica",
+                "lyricsSnippet": str(parsed.get("lyricsHeard", "")).strip(),
+                "source": "Gemini Audio"
+            }
     except Exception as e:
-        print("Gemini error:", e)
+        print("Gemini audio error:", e)
     return None
 
 
 def analyze_youtube_direct_with_gemini(yt_url, gemini_key, start_min, end_min):
-    """Respaldo directo: Google procesa la URL de YouTube sin bloqueos de IP."""
-    prompt = f"""Escucha el audio de este video de YouTube entre el minuto {start_min} y el minuto {end_min}.
-Identifica TODAS las canciones reales que suenan en orden cronológico. NO inventes temas.
+    """Respaldo directo: Google procesa la URL de YouTube sin descarga local."""
+    prompt = f"""Escucha el audio de este video de YouTube únicamente entre el minuto {start_min} y el minuto {end_min}.
+Identifica las canciones reales que suenan en orden cronológico dentro de ese rango.
+NO inventes temas ni incluyas canciones fuera de ese rango.
 Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
 {{
   "videoTitle": "Título del video o mix",
   "tracks": [
     {{
-      "timestampSec": 0,
+      "timestampSec": {start_min * 60},
       "title": "Nombre real de la canción",
       "artist": "Artista real",
       "genre": "Género"
@@ -165,55 +213,46 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
         }
     }
 
-    res = None
-    last_err = ""
-    for model_name in ["gemini-3.0-flash", "gemini-3.8-flash"]:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
-        for attempt in range(3):
-            res = requests.post(endpoint, json=payload, timeout=120)
-            if res.ok:
-                break
-            err_json = res.json() if res.content else {}
-            last_err = err_json.get("error", {}).get("message", res.text)
-            if "high demand" in last_err.lower() or res.status_code in (429, 503):
-                time.sleep(3 * (attempt + 1))
-                continue
-            break
-        if res and res.ok:
-            break
+    data = post_gemini_with_fallback(gemini_key, payload, timeout_sec=75)
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    raw = "\n".join(p.get("text", "") for p in parts)
+    parsed = parse_json_safely(raw)
 
-    if not res or not res.ok:
-        raise RuntimeError(f"Gemini Directo falló: {last_err}")
-
-    raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-    parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
+    min_allowed_sec = start_min * 60
+    max_allowed_sec = end_min * 60
 
     tracks = []
     for t in parsed.get("tracks", []):
-        if t.get("title"):
-            tracks.append({
-                "timestampSec": int(t.get("timestampSec", 0)),
-                "title": str(t.get("title", "")).strip(),
-                "artist": str(t.get("artist", "Artista")).strip(),
-                "genre": str(t.get("genre", "Mix")).strip(),
-                "lyricsSnippet": "Reconocido directo desde YouTube",
-                "coverUrl": "",
-                "previewUrl": "",
-                "spotifyUrl": "",
-                "source": "Gemini YouTube Directo"
-            })
+        title = str(t.get("title", "")).strip()
+        if not title:
+            continue
+        sec = int(t.get("timestampSec", min_allowed_sec) or min_allowed_sec)
+        if sec < min_allowed_sec or sec > max_allowed_sec:
+            continue
+        tracks.append({
+            "timestampSec": sec,
+            "title": title,
+            "artist": str(t.get("artist", "Artista")).strip() or "Artista",
+            "genre": str(t.get("genre", "Mix")).strip() or "Mix",
+            "lyricsSnippet": "Reconocido directo desde YouTube",
+            "coverUrl": "",
+            "previewUrl": "",
+            "spotifyUrl": "",
+            "source": "Gemini YouTube Directo"
+        })
 
-    return parsed.get("videoTitle", "Mix de YouTube"), tracks
+    tracks.sort(key=lambda item: item["timestampSec"])
+    return str(parsed.get("videoTitle", "Mix de YouTube")).strip(), tracks
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v4"})
+    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v5"})
 
 
 @app.route("/api/scan-youtube", methods=["POST"])
 def scan_youtube():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     url = (data.get("url") or "").strip()
     start_min = max(0, int(data.get("start_min", 0)))
     end_min = max(start_min + 1, int(data.get("end_min", 10)))
