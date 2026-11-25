@@ -109,35 +109,39 @@ def recognize_audd(wav_path, audd_key):
         data = res.json()
         if data.get("status") == "success" and data.get("result"):
             r = data["result"]
+            title = str(r.get("title", "")).strip()
+            artist = str(r.get("artist", "")).strip()
+            if not title:
+                return None
             sp = r.get("spotify") or {}
             dz = r.get("deezer") or {}
             return {
                 "recognized": True,
-                "title": r.get("title", ""),
-                "artist": r.get("artist", ""),
-                "album": r.get("album", "AudD Shazam"),
+                "title": title,
+                "artist": artist or "Artista Detectado",
+                "album": str(r.get("album", "AudD Huella Acústica")).strip(),
                 "coverUrl": (
                     sp.get("album", {}).get("images", [{}])[0].get("url")
                     or dz.get("album", {}).get("cover_medium", "")
                 ),
                 "previewUrl": sp.get("preview_url") or dz.get("preview", ""),
                 "spotifyUrl": sp.get("external_urls", {}).get("spotify", ""),
-                "source": "Shazam / AudD"
+                "source": "AudD Huella Acústica"
             }
     except Exception as e:
         print("AudD error:", e)
     return None
 
 
-def recognize_gemini(wav_path, gemini_key, timestamp_sec, genre_hint=""):
+def recognize_gemini_clip(wav_path, gemini_key, timestamp_sec, genre_hint=""):
     if not gemini_key:
         return None
     try:
         with open(wav_path, "rb") as f:
             b64_audio = base64.b64encode(f.read()).decode("utf-8")
 
-        prompt = f"""Escucha este fragmento de audio real (minuto {timestamp_sec}s).
-NO inventes canciones. Transcribe la letra que escuches e identifica el título y artista reales.
+        prompt = f"""Escucha este fragmento de audio real (segundo {timestamp_sec}).
+NO inventes canciones ni uses capítulos o descripciones. Identifica únicamente lo que suena en este clip.
 {f'Pista de género: {genre_hint}' if genre_hint else ''}
 Devuelve SOLO JSON:
 {{"recognized": true, "title": "Título real o vacío", "artist": "Artista real o vacío", "lyricsHeard": "Letra escuchada", "genre": "Género"}}"""
@@ -169,18 +173,18 @@ Devuelve SOLO JSON:
                 "artist": str(parsed.get("artist", "Artista Detectado")).strip() or "Artista Detectado",
                 "album": str(parsed.get("genre", "IA Acústica")).strip() or "IA Acústica",
                 "lyricsSnippet": str(parsed.get("lyricsHeard", "")).strip(),
-                "source": "Gemini Audio"
+                "source": "Gemini Clip"
             }
     except Exception as e:
-        print("Gemini audio error:", e)
+        print("Gemini clip error:", e)
     return None
 
 
 def analyze_youtube_direct_with_gemini(yt_url, gemini_key, start_min, end_min):
-    """Respaldo directo: Google procesa la URL de YouTube sin descarga local."""
-    prompt = f"""Escucha el audio de este video de YouTube únicamente entre el minuto {start_min} y el minuto {end_min}.
-Identifica las canciones reales que suenan en orden cronológico dentro de ese rango.
-NO inventes temas ni incluyas canciones fuera de ese rango.
+    """Respaldo directo de audio cuando yt-dlp es bloqueado en el servidor."""
+    prompt = f"""Escucha el audio de este video de YouTube entre el minuto {start_min} y el minuto {end_min},
+sin depender de capítulos ni texto de descripción.
+Identifica las canciones reales que suenan en orden cronológico dentro de ese rango. NO inventes temas.
 Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
 {{
   "videoTitle": "Título del video o mix",
@@ -234,11 +238,11 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
             "title": title,
             "artist": str(t.get("artist", "Artista")).strip() or "Artista",
             "genre": str(t.get("genre", "Mix")).strip() or "Mix",
-            "lyricsSnippet": "Reconocido directo desde YouTube",
+            "lyricsSnippet": "Reconocido por audio directo",
             "coverUrl": "",
             "previewUrl": "",
             "spotifyUrl": "",
-            "source": "Gemini YouTube Directo"
+            "source": "Gemini Audio Directo"
         })
 
     tracks.sort(key=lambda item: item["timestampSec"])
@@ -247,7 +251,12 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v5"})
+    return jsonify({
+        "status": "ok",
+        "engine": "SONICDJ Cloud Server v6 (AudD Priority)",
+        "auddConfigured": bool((os.environ.get("AUDD_API_KEY") or "").strip()),
+        "geminiConfigured": bool((os.environ.get("GEMINI_API_KEY") or "").strip())
+    })
 
 
 @app.route("/api/scan-youtube", methods=["POST"])
@@ -257,7 +266,7 @@ def scan_youtube():
     start_min = max(0, int(data.get("start_min", 0)))
     end_min = max(start_min + 1, int(data.get("end_min", 10)))
     interval_sec = max(15, int(data.get("interval_sec", 60)))
-    sample_sec = max(5, min(15, int(data.get("sample_sec", 8))))
+    sample_sec = max(6, min(15, int(data.get("sample_sec", 10))))
 
     gemini_key = (data.get("gemini_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
     audd_key = (data.get("audd_key") or os.environ.get("AUDD_API_KEY") or "").strip()
@@ -265,8 +274,8 @@ def scan_youtube():
 
     if not url:
         return jsonify({"error": "Falta el enlace de YouTube."}), 400
-    if not gemini_key and not audd_key:
-        return jsonify({"error": "Falta configurar GEMINI_API_KEY en Render."}), 400
+    if not audd_key and not gemini_key:
+        return jsonify({"error": "Configura AUDD_API_KEY o GEMINI_API_KEY en Render."}), 400
 
     tmp_dir = tempfile.mkdtemp(prefix="sonicdj_")
     try:
@@ -295,9 +304,11 @@ def scan_youtube():
             if not extract_wav_clip(downloaded_file, t, sample_sec, wav_clip):
                 continue
 
+            # 1. Prioridad: Huella acústica con AudD
             match = recognize_audd(wav_clip, audd_key)
-            if not match:
-                match = recognize_gemini(wav_clip, gemini_key, t, genre_hint)
+            # 2. Respaldo por clip: Gemini Audio si AudD no devolvió resultado
+            if not match and gemini_key:
+                match = recognize_gemini_clip(wav_clip, gemini_key, t, genre_hint)
 
             if match and match.get("recognized"):
                 tracks.append({
@@ -320,7 +331,7 @@ def scan_youtube():
         })
 
     except Exception as ydl_err:
-        print("yt-dlp bloqueado en Render, usando Gemini Directo:", ydl_err)
+        print("yt-dlp bloqueado o falló en Render:", ydl_err)
         if gemini_key:
             try:
                 video_title, tracks = analyze_youtube_direct_with_gemini(url, gemini_key, start_min, end_min)
@@ -331,8 +342,8 @@ def scan_youtube():
                     "tracks": tracks
                 })
             except Exception as gem_err:
-                return jsonify({"error": f"YouTube bloqueó la descarga y el respaldo falló: {str(gem_err)}"}), 500
-        return jsonify({"error": f"Error procesando YouTube: {str(ydl_err)}"}), 500
+                return jsonify({"error": f"YouTube bloqueó el audio en el servidor y el respaldo falló: {str(gem_err)}"}), 500
+        return jsonify({"error": f"YouTube bloqueó el audio y no hay AUDD_API_KEY/GEMINI_API_KEY activa: {str(ydl_err)}"}), 500
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
