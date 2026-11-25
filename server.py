@@ -101,7 +101,7 @@ Devuelve SOLO JSON:
             }
         }
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent?key={gemini_key}"
         res = requests.post(url, json=payload, timeout=30)
         if res.ok:
             raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
