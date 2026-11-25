@@ -120,9 +120,72 @@ Devuelve SOLO JSON:
     return None
 
 
+def analyze_youtube_direct_with_gemini(yt_url, gemini_key, start_min, end_min):
+    """Respaldo directo: Google procesa la URL de YouTube sin bloqueos de IP."""
+    prompt = f"""Escucha el audio de este video de YouTube entre el minuto {start_min} y el minuto {end_min}.
+Identifica TODAS las canciones reales que suenan en orden cronológico. NO inventes temas.
+Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
+{{
+  "videoTitle": "Título del video o mix",
+  "tracks": [
+    {{
+      "timestampSec": 0,
+      "title": "Nombre real de la canción",
+      "artist": "Artista real",
+      "genre": "Género"
+    }}
+  ]
+}}"""
+
+    payload = {
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {
+                    "fileData": {
+                        "mimeType": "video/mp4",
+                        "fileUri": yt_url
+                    }
+                },
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.1
+        }
+    }
+
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+    res = requests.post(endpoint, json=payload, timeout=120)
+    if not res.ok:
+        err_msg = res.json().get("error", {}).get("message", res.text)
+        raise RuntimeError(f"Gemini Directo falló: {err_msg}")
+
+    raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+    parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
+
+    tracks = []
+    for t in parsed.get("tracks", []):
+        if t.get("title"):
+            tracks.append({
+                "timestampSec": int(t.get("timestampSec", 0)),
+                "title": str(t.get("title", "")).strip(),
+                "artist": str(t.get("artist", "Artista")).strip(),
+                "genre": str(t.get("genre", "Mix")).strip(),
+                "lyricsSnippet": "Reconocido directo desde YouTube",
+                "coverUrl": "",
+                "previewUrl": "",
+                "spotifyUrl": "",
+                "source": "Gemini YouTube Directo"
+            })
+
+    return parsed.get("videoTitle", "Mix de YouTube"), tracks
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server"})
+    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v2"})
 
 
 @app.route("/api/scan-youtube", methods=["POST"])
@@ -134,7 +197,6 @@ def scan_youtube():
     interval_sec = max(15, int(data.get("interval_sec", 60)))
     sample_sec = max(5, min(15, int(data.get("sample_sec", 8))))
 
-    # Usa la key del usuario o la key guardada en Render automáticamente
     gemini_key = (data.get("gemini_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
     audd_key = (data.get("audd_key") or os.environ.get("AUDD_API_KEY") or "").strip()
     genre_hint = (data.get("genre_hint") or "").strip()
@@ -142,25 +204,19 @@ def scan_youtube():
     if not url:
         return jsonify({"error": "Falta el enlace de YouTube."}), 400
     if not gemini_key and not audd_key:
-        return jsonify({"error": "No hay API Key configurada en el servidor ni en la app."}), 400
+        return jsonify({"error": "Falta configurar GEMINI_API_KEY en Render."}), 400
 
+    # 1. Intentar descarga tradicional con yt-dlp
     tmp_dir = tempfile.mkdtemp(prefix="sonicdj_")
     try:
         out_template = os.path.join(tmp_dir, "audio.%(ext)s")
         ydl_opts = {
-         "format": "bestaudio/best",
-         "outtmpl": out_template,
-         "quiet": True,
-         "noplaylist": True,
-         "extractor_args": {
-             "youtube": {
-                 "player_client": ["ios", "android", "tv_embedded"]
-             }
-         },
-         "http_headers": {
-             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-         }
-     }
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "quiet": True,
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["ios", "android"]}},
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             video_title = info.get("title", "Mix de YouTube")
@@ -202,8 +258,21 @@ def scan_youtube():
             "tracks": tracks
         })
 
-    except Exception as e:
-        return jsonify({"error": f"Error procesando YouTube: {str(e)}"}), 500
+    except Exception as ydl_err:
+        print("yt-dlp bloqueado en Render, usando Gemini Directo:", ydl_err)
+        # 2. Respaldo automático sin bloqueo de YouTube
+        if gemini_key:
+            try:
+                video_title, tracks = analyze_youtube_direct_with_gemini(url, gemini_key, start_min, end_min)
+                return jsonify({
+                    "status": "ok",
+                    "title": video_title,
+                    "duration": end_min * 60,
+                    "tracks": tracks
+                })
+            except Exception as gem_err:
+                return jsonify({"error": f"YouTube bloqueó la descarga y el respaldo falló: {str(gem_err)}"}), 500
+        return jsonify({"error": f"Error procesando YouTube: {str(ydl_err)}"}), 500
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
