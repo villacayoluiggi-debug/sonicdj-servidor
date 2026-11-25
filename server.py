@@ -148,11 +148,19 @@ def scan_youtube():
     try:
         out_template = os.path.join(tmp_dir, "audio.%(ext)s")
         ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": out_template,
-            "quiet": True,
-            "noplaylist": True,
-        }
+         "format": "bestaudio/best",
+         "outtmpl": out_template,
+         "quiet": True,
+         "noplaylist": True,
+         "extractor_args": {
+             "youtube": {
+                 "player_client": ["ios", "android", "tv_embedded"]
+             }
+         },
+         "http_headers": {
+             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+         }
+     }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             video_title = info.get("title", "Mix de YouTube")
