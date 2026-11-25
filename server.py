@@ -253,10 +253,48 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
 def health():
     return jsonify({
         "status": "ok",
-        "engine": "SONICDJ Cloud Server v6 (AudD Priority)",
+        "engine": "SONICDJ Cloud Server v7",
         "auddConfigured": bool((os.environ.get("AUDD_API_KEY") or "").strip()),
         "geminiConfigured": bool((os.environ.get("GEMINI_API_KEY") or "").strip())
     })
+
+
+@app.route("/api/recognize-clip", methods=["POST"])
+def recognize_clip():
+    if "file" not in request.files:
+        return jsonify({"error": "Falta el archivo de audio."}), 400
+
+    timestamp_sec = int(request.form.get("timestamp_sec", 0) or 0)
+    gemini_key = (request.form.get("gemini_key") or os.environ.get("GEMINI_API_KEY") or "").strip()
+    audd_key = (request.form.get("audd_key") or os.environ.get("AUDD_API_KEY") or "").strip()
+
+    if not audd_key and not gemini_key:
+        return jsonify({"error": "Configura AUDD_API_KEY o GEMINI_API_KEY en Render."}), 400
+
+    tmp_dir = tempfile.mkdtemp(prefix="sonicdj_clip_")
+    try:
+        wav_path = os.path.join(tmp_dir, "clip.wav")
+        request.files["file"].save(wav_path)
+
+        match = recognize_audd(wav_path, audd_key)
+        if not match and gemini_key:
+            match = recognize_gemini_clip(wav_path, gemini_key, timestamp_sec)
+
+        if match and match.get("recognized"):
+            return jsonify({
+                "status": "ok",
+                "track": {
+                    "timestampSec": timestamp_sec,
+                    "title": match["title"],
+                    "artist": match["artist"],
+                    "coverUrl": match.get("coverUrl", ""),
+                    "previewUrl": match.get("previewUrl", ""),
+                    "spotifyUrl": match.get("spotifyUrl", "")
+                }
+            })
+        return jsonify({"status": "ok", "track": None})
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @app.route("/api/scan-youtube", methods=["POST"])
@@ -304,9 +342,7 @@ def scan_youtube():
             if not extract_wav_clip(downloaded_file, t, sample_sec, wav_clip):
                 continue
 
-            # 1. Prioridad: Huella acústica con AudD
             match = recognize_audd(wav_clip, audd_key)
-            # 2. Respaldo por clip: Gemini Audio si AudD no devolvió resultado
             if not match and gemini_key:
                 match = recognize_gemini_clip(wav_clip, gemini_key, t, genre_hint)
 
