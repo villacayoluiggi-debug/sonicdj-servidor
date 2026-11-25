@@ -101,20 +101,21 @@ Devuelve SOLO JSON:
             }
         }
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.0-flash:generateContent?key={gemini_key}"
-        res = requests.post(url, json=payload, timeout=30)
-        if res.ok:
-            raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
-            if parsed.get("title"):
-                return {
-                    "recognized": True,
-                    "title": parsed.get("title", "").strip(),
-                    "artist": parsed.get("artist", "Artista Detectado").strip(),
-                    "album": parsed.get("genre", "IA Acústica"),
-                    "lyricsSnippet": parsed.get("lyricsHeard", ""),
-                    "source": "Gemini Audio"
-                }
+        for model_name in ["gemini-3.0-flash", "gemini-3.8-flash"]:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+            res = requests.post(url, json=payload, timeout=30)
+            if res.ok:
+                raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
+                if parsed.get("title"):
+                    return {
+                        "recognized": True,
+                        "title": parsed.get("title", "").strip(),
+                        "artist": parsed.get("artist", "Artista Detectado").strip(),
+                        "album": parsed.get("genre", "IA Acústica"),
+                        "lyricsSnippet": parsed.get("lyricsHeard", ""),
+                        "source": "Gemini Audio"
+                    }
     except Exception as e:
         print("Gemini error:", e)
     return None
@@ -156,11 +157,17 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
         }
     }
 
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-    res = requests.post(endpoint, json=payload, timeout=120)
-    if not res.ok:
-        err_msg = res.json().get("error", {}).get("message", res.text)
-        raise RuntimeError(f"Gemini Directo falló: {err_msg}")
+    res = None
+    last_err = ""
+    for model_name in ["gemini-3.0-flash", "gemini-3.8-flash"]:
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+        res = requests.post(endpoint, json=payload, timeout=120)
+        if res.ok:
+            break
+        last_err = res.json().get("error", {}).get("message", res.text)
+
+    if not res or not res.ok:
+        raise RuntimeError(f"Gemini Directo falló: {last_err}")
 
     raw = res.json()["candidates"][0]["content"]["parts"][0]["text"]
     parsed = json.loads(raw.replace("```json", "").replace("```", "").strip())
@@ -185,7 +192,7 @@ Devuelve ÚNICAMENTE un objeto JSON con este formato exacto:
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v2"})
+    return jsonify({"status": "ok", "engine": "SONICDJ Cloud Server v3"})
 
 
 @app.route("/api/scan-youtube", methods=["POST"])
@@ -206,7 +213,6 @@ def scan_youtube():
     if not gemini_key and not audd_key:
         return jsonify({"error": "Falta configurar GEMINI_API_KEY en Render."}), 400
 
-    # 1. Intentar descarga tradicional con yt-dlp
     tmp_dir = tempfile.mkdtemp(prefix="sonicdj_")
     try:
         out_template = os.path.join(tmp_dir, "audio.%(ext)s")
@@ -260,7 +266,6 @@ def scan_youtube():
 
     except Exception as ydl_err:
         print("yt-dlp bloqueado en Render, usando Gemini Directo:", ydl_err)
-        # 2. Respaldo automático sin bloqueo de YouTube
         if gemini_key:
             try:
                 video_title, tracks = analyze_youtube_direct_with_gemini(url, gemini_key, start_min, end_min)
